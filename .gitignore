@@ -1,0 +1,36 @@
+# python cache / bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.python-version
+
+# virtual envs / build metadata
+.env/
+.venv/
+env/
+venv/
+*.egg-info/
+
+# data & heavy outputs (DO NOT PUSH)
+data/
+outputs/
+checkpoints/
+*.h5
+*.hdf5
+*.ckpt
+*.npz
+*.npy
+*.csv
+!outputs/.gitkeep
+
+# notebooks (keep local)
+.ipynb_checkpoints/
+*.ipynb
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
