@@ -69,15 +69,37 @@ SPATIAL_LAMBDA      = 5e-4
 
 # Teacher distillation (optional)
 TEACHER_WEIGHTS = REPO_ROOT / "data" / "best.weights.h5"
+# --- Distillation toggle + preflight (no model building here) ---
+USE_DISTILLATION = True  # flip to False for ablation
+RUN_TAG = "distill" if USE_DISTILLATION else "nodistill"
+
+if USE_DISTILLATION and not Path(TEACHER_WEIGHTS).exists():
+    print("[warn] USE_DISTILLATION=True, but teacher weights not found → switching to no-distill.")
+    USE_DISTILLATION = False
+    RUN_TAG = "nodistill"
+
 TEACHER_GATE_TYPE   = "relu"
 
-# Outputs
-OUTDIR = (REPO_ROOT / "outputs"); OUTDIR.mkdir(parents=True, exist_ok=True)
-print("[paths] OUTDIR →", OUTDIR.resolve())
 
-WEIGHTS_STUDENT = OUTDIR/"vc_student_final.weights.h5"
-COEF_CSV_ALL    = OUTDIR/"vc_coefficients_ALL.csv"
-THR_CSV_ALL     = OUTDIR/"vc_thresholds_ALL.csv"
+
+# Outputs
+OUTDIR = (REPO_ROOT / "outputs").resolve()
+RUN_DIR = (OUTDIR / "ablation" / RUN_TAG)
+RUN_DIR.mkdir(parents=True, exist_ok=True)
+print("[paths] OUTDIR →", OUTDIR)
+print("[paths] RUN_DIR →", RUN_DIR)
+
+# Tagged artifacts (no clobbering between runs)
+WEIGHTS_STUDENT = RUN_DIR / f"vc_student_final__{RUN_TAG}.weights.h5"
+PRED_TEST_CSV   = RUN_DIR / f"predictions_test__{RUN_TAG}.csv"
+HIST_CSV        = RUN_DIR / f"history__{RUN_TAG}.csv"
+COEF_CSV_ALL    = RUN_DIR / f"vc_coefficients_ALL__{RUN_TAG}.csv"
+THR_CSV_ALL     = RUN_DIR / f"vc_thresholds_ALL__{RUN_TAG}.csv"
+INDEX_W_CSV     = RUN_DIR / f"index_weights__{RUN_TAG}.csv"
+INDEX_BIAS_JSON = RUN_DIR / f"index_bias__{RUN_TAG}.json"
+INDEX_CONTRIB_CSV = RUN_DIR / f"index_contributions_ALL__{RUN_TAG}.csv"
+EFFECTS_OUT     = RUN_DIR / f"index_weight_effects_per1SD__{RUN_TAG}.csv"
+
 
 # 2---------------------------------- Load & basic prep ----------------------------------
 raw = pd.read_csv(DATA_PATH, low_memory=False)
@@ -332,37 +354,53 @@ def build_vc_student_v2(x_dim, z_dim, r_dim, z_names,
 #7 ---------------------------------- Regularizers ----------------------------------
 @tf.function
 def region_pairwise_regularization(c_points, region_matrix, lambda_reg=0.02):
-    reg_loss = 0.0
+    """Pairwise dispersion of cutting points within each region (scale-invariant)."""
+    dtype = c_points.dtype
+    reg_loss = tf.zeros((), dtype=dtype)  # dtype/device-safe init
     region_ids = tf.argmax(region_matrix, axis=1)
     unique_regions = tf.unique(region_ids)[0]
+
     for r in unique_regions:
         mask = tf.equal(region_ids, r)
         c_r  = tf.boolean_mask(c_points, mask)     # [Nr, 3]
         nr   = tf.shape(c_r)[0]
-        xdim = tf.cast(tf.shape(c_r)[1], tf.float32)
+        xdim = tf.cast(tf.shape(c_r)[1], dtype)
+
         def _region_loss():
             c0 = c_r - tf.reduce_mean(c_r, axis=0, keepdims=True)
             sum_sq = tf.reduce_sum(tf.reduce_sum(tf.square(c0), axis=1))
-            n_pairs = tf.cast(nr * (nr - 1) // 2, tf.float32)
-            return (2.0 * sum_sq) / (tf.maximum(n_pairs, 1.0) * xdim)
-        reg_loss += tf.cond(nr > 1, _region_loss, lambda: 0.0)
-    return lambda_reg * reg_loss
+            n_pairs = tf.cast(nr * (nr - 1) // 2, dtype)
+            denom = tf.maximum(n_pairs, tf.constant(1.0, dtype=dtype)) * xdim
+            return (tf.constant(2.0, dtype=dtype) * sum_sq) / denom
+
+        reg_loss += tf.cond(nr > 1, _region_loss, lambda: tf.zeros((), dtype=dtype))
+
+    return tf.cast(lambda_reg, dtype) * reg_loss
+
 
 @tf.function
 def spatial_smoothness_regularization(c_points, coords_std, k=5, lambda_space=5e-4):
+    """K-NN smoothness of cutting points over standardized coordinates."""
+    dtype = c_points.dtype
     B = tf.shape(coords_std)[0]
-    xdim = tf.cast(tf.shape(c_points)[1], tf.float32)
-    c2 = tf.reduce_sum(tf.square(coords_std), axis=1, keepdims=True)
-    d2 = c2 - 2.0 * tf.matmul(coords_std, coords_std, transpose_b=True) + tf.transpose(c2)
-    big = tf.reduce_max(d2) + 1.0
+    xdim = tf.cast(tf.shape(c_points)[1], dtype)
+
+    # pairwise squared distances in standardized coord space
+    c2 = tf.reduce_sum(tf.square(coords_std), axis=1, keepdims=True)              # [B,1]
+    d2 = c2 - tf.cast(2.0, dtype) * tf.matmul(coords_std, coords_std, transpose_b=True) + tf.transpose(c2)
+    big = tf.reduce_max(d2) + tf.constant(1.0, dtype=dtype)
     d2 = tf.linalg.set_diag(d2, tf.fill([B], big))
-    _, idxs = tf.nn.top_k(-d2, k=k)
-    c_nb = tf.gather(c_points, idxs)
-    c_i  = tf.expand_dims(c_points, axis=1)
-    diffs = c_i - c_nb
-    sq = tf.reduce_sum(tf.square(diffs), axis=2)
-    loss = tf.reduce_mean(tf.reduce_mean(sq, axis=1))
-    return lambda_space * (loss / tf.maximum(xdim, 1.0))
+
+    # k nearest neighbors (by small distance => large -d2)
+    _, idxs = tf.nn.top_k(-d2, k=k)                                               # [B,k]
+    c_nb = tf.gather(c_points, idxs)                                              # [B,k,3]
+    c_i  = tf.expand_dims(c_points, axis=1)                                       # [B,1,3]
+    diffs = c_i - c_nb                                                            # [B,k,3]
+    sq = tf.reduce_sum(tf.square(diffs), axis=2)                                  # [B,k]
+    loss = tf.reduce_mean(tf.reduce_mean(sq, axis=1))                             # scalar
+
+    return tf.cast(lambda_space, dtype) * (loss / tf.maximum(xdim, tf.constant(1.0, dtype=dtype)))
+
 
 #8 ---------------------------------- Keras wrapper ----------------------------------
     # Part 8: define how training is performed (adds custom losses)
@@ -412,9 +450,10 @@ class VCStudentModel(tf.keras.Model):
         self.compute_metrics(x=inputs, y=y_true, y_pred=y_pred)
         return {m.name: m.result() for m in self.metrics}
 
-#9 ---------------------------------- Build models ----------------------------------
-# Part 9: assemble everything (and a teacher if present)
+# 9 ---------------------------------- Build models ----------------------------------
 r_dim = R_train.shape[1]
+x_dim, z_dim = len(x_input_vars), len(z_input_vars)
+
 base_student = build_vc_student_v2(
     x_dim, z_dim, r_dim, z_names=z_input_vars,
     gate_type=GATE_TYPE, gate_k=GATE_K,
@@ -424,13 +463,14 @@ base_student = build_vc_student_v2(
 )
 print("Student outputs:", base_student.output_names)
 
-if TEACHER_WEIGHTS and Path(TEACHER_WEIGHTS).exists():
+# --- Teacher (conditional on toggle; no path logic here—the preflight already set RUN_TAG) ---
+teacher = None
+if USE_DISTILLATION:
     teacher = build_teacher(x_dim, z_dim, r_dim, gate_type=TEACHER_GATE_TYPE, gate_k=GATE_K)
     teacher.load_weights(TEACHER_WEIGHTS)
     print(f"[ok] Loaded teacher weights: {TEACHER_WEIGHTS}")
 else:
-    print("[warn] Teacher not found → training student without distillation.")
-    teacher = None
+    print("[info] Training student without distillation (USE_DISTILLATION=False).")
 
 vc_student = VCStudentModel(
     base_student,
@@ -439,6 +479,8 @@ vc_student = VCStudentModel(
     k_neighbors=SPATIAL_K, coord_idxs=coord_idxs
 )
 print("Wrapper ready. RegionReg:", USE_REGION_REG, " SpatialReg:", USE_SPATIAL_REG, " coords ok:", HAS_COORDS)
+
+
 
 #10 ---------------------------------- Distillation targets ----------------------------------
 if teacher is not None:
@@ -492,26 +534,30 @@ hist = vc_student.fit([X_train, Z_train, R_train], train_targets,
                       epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=1, callbacks=cb)
 
 
-#12---------------------------------- Evaluate ----------------------------------
+# -------- Evaluate --------
 outs_test = vc_student.core.predict([X_test, Z_test, R_test], batch_size=4096, verbose=0)
 yprob_te  = outs_test[0].ravel()
-auc = roc_auc_score(y_test, yprob_te); acc = accuracy_score(y_test, (yprob_te>0.5).astype(int))
+auc = roc_auc_score(y_test, yprob_te)
+acc = accuracy_score(y_test, (yprob_te > 0.5).astype(int))
 print(f"[TEST] AUC={auc:.4f} | Acc={acc:.4f}")
 
+# Save test-set predictions
+pd.DataFrame({"y_true": y_test.astype(int), "y_prob": yprob_te}).to_csv(PRED_TEST_CSV, index=False)
+print(f"[ok] Saved test predictions → {PRED_TEST_CSV}")
+
+# Distillation diagnostics (if applicable)
 if teacher is not None:
     _, teacher_val_cuts = teacher.predict([X_val, Z_val, R_val], batch_size=4096, verbose=0)
     student_val_cuts    = vc_student.core.predict([X_val, Z_val, R_val], batch_size=4096, verbose=0)[1]
     mse_cuts = np.mean((teacher_val_cuts - student_val_cuts)**2)
     print(f"[distill] Teacher–Student cut MSE (val): {mse_cuts:.6f}")
 
-pd.DataFrame({"y_true": y_test.astype(int), "y_prob": yprob_te}).to_csv(
-    OUTDIR / "predictions_test.csv", index=False
-)
-print("[ok] Saved test predictions →", OUTDIR / "predictions_test.csv")
+# Save training history (once, to the run-tagged path)
+hist_df = pd.DataFrame(hist.history)
+hist_df["epoch"] = np.arange(len(hist_df))
+hist_df.to_csv(HIST_CSV, index=False)
+print(f"[ok] Saved training history → {HIST_CSV}")
 
-hist_df = pd.DataFrame(hist.history); hist_df["epoch"] = np.arange(len(hist_df))
-hist_df.to_csv(OUTDIR / "history.csv", index=False)
-print("[ok] Saved training history →", OUTDIR / "history.csv")
 
 #13 -----------------------------------Export interpretable outputs (all rows) ---------------------------------
 # ---------------------------------- Export β,β0​,I(z) ----------------------------------
@@ -566,12 +612,14 @@ if USE_INTERNAL_INDEX:
         "Z_mean":     z_means,
         "Z_std":      z_scales
     }).sort_values("alpha_stdZ", key=lambda s: np.abs(s), ascending=False)
-    weights_df.to_csv(OUTDIR / "index_weights.csv", index=False)
-    print("[ok] Saved index weights →", OUTDIR / "index_weights.csv")
+    weights_df.to_csv(INDEX_W_CSV, index=False)
+    print(f"[ok] Saved index weights → {INDEX_W_CSV}")
 
-    (OUTDIR / "index_bias.json").write_text(
-        json.dumps({"bias_stdZ": float(bias_std), "bias_orig": float(bias_orig)}, indent=2)
+
+    INDEX_BIAS_JSON.write_text(
+    json.dumps({"bias_stdZ": float(bias_std), "bias_orig": float(bias_orig)}, indent=2)
     )
+
 
     Z_std_all = Z_all  
     contrib_mat = Z_std_all * alpha_std.reshape(1, -1)  
@@ -589,8 +637,9 @@ if USE_INTERNAL_INDEX:
     })
     contrib_df["Index_I_from_parts"] = contrib_df.filter(like="contrib_", axis=1).sum(axis=1).astype(float) + contrib_df["bias_stdZ"].astype(float)
 
-    contrib_df.to_csv(OUTDIR / "index_contributions_ALL.csv", index=False)
-    print("[ok] Saved per-row Index_I contributions →", OUTDIR / "index_contributions_ALL.csv")
+    contrib_df.to_csv(INDEX_CONTRIB_CSV, index=False)
+    print("[ok] Saved per-row Index_I contributions →", INDEX_CONTRIB_CSV)
+   
 
     # 4) Quick summary
     top_k = min(10, len(weights_df))
@@ -632,8 +681,6 @@ print(f"[ordering] Dew ≤ WBT ≤ Air holds for {ord_mask.mean()*100:.4f}% "
       f"({ord_mask.sum():,}/{len(ord_mask):,})")
 
 # --------------------Effects of each Z (per +1 SD) on thresholds -----------------------------------------
-EFFECTS_OUT = OUTDIR / "index_weight_effects_per1SD.csv"
-print("[effects] computing per-1SD threshold effects →", EFFECTS_OUT)
 
 # For speed you can subsample; set N_SAMPLES = len(Z_all) to use all rows
 N_SAMPLES = min(100_000, len(Z_all))
