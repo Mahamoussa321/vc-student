@@ -1,36 +1,84 @@
-# python cache / bytecode
+﻿# =========================
+# Python / R cache files
+# =========================
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.python-version
-
-# virtual envs / build metadata
-.env/
-.venv/
-env/
-venv/
-*.egg-info/
-
-# data & heavy outputs (DO NOT PUSH)
-data/
-outputs/
-checkpoints/
-*.h5
-*.hdf5
-*.ckpt
-*.npz
-*.npy
-*.csv
-!outputs/.gitkeep
-
-# notebooks (keep local)
+*.py[cod]
 .ipynb_checkpoints/
-*.ipynb
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
 
-# OS / editor noise
+# =========================
+# OS / editor files
+# =========================
 .DS_Store
 Thumbs.db
-.vscode/*
-!.vscode/settings.json
-!.vscode/launch.json
+.vscode/
+*.bak
+*.tmp
+
+# =========================
+# Environments
+# =========================
+.venv/
+venv/
+env/
+*.egg-info/
+
+# =========================
+# Large data and generated outputs
+# =========================
+data/*.csv
+data/*.rds
+data/*.RDS
+data/*.parquet
+data/*.pkl
+data/*.npz
+data/*.npy
+
+outputs/
+!outputs/README.md
+
+# =========================
+# Logs
+# =========================
+*.log
+*.log.txt
+
+# =========================
+# Generated figures
+# =========================
+figures/*.png
+figures/*.pdf
+figures/*.jpg
+figures/*.jpeg
+figures/*.tiff
+!figures/README.md
+
+# =========================
+# LaTeX build files
+# =========================
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.out
+*.synctex.gz
+*.toc
+
+# Local archive not pushed to GitHub
+_local_archive_not_for_github/
+
+# Extra data exclusions
+data/*.h5
+data/figures/
+data/make_phase_maps_climate_boundaries_ascii_fixed.R
+!data/README.md
+!data/Koeppen-Geiger-ASCII.txt
+
+# Keep output folder documentation, ignore generated output files
+!outputs/
+outputs/*
+!outputs/README.md
